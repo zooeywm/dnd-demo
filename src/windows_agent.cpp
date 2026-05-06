@@ -519,32 +519,42 @@ public:
         if (m_position >= m_metadata.size) {
             qInfo().noquote() << "IStream::Read offset:" << m_position
                               << "size:" << cb
-                              << "result: EOF";
-            return S_FALSE;
+                              << "result: EOF(S_OK,0)";
+            return S_OK;
         }
 
-        const quint32 requestSize = static_cast<quint32>(qMin<quint64>(cb, m_metadata.size - m_position));
+        const quint64 remain = m_metadata.size - m_position;
+        const quint32 requestSize = static_cast<quint32>(qMin<quint64>(cb, remain));
         QByteArray data;
-        const HRESULT hr = m_readBroker->read(m_position, requestSize, data);
+        const quint64 readOffset = m_position;
+        const HRESULT hr = m_readBroker->read(readOffset, requestSize, data);
         if (FAILED(hr)) {
-            qInfo().noquote() << "IStream::Read offset:" << m_position
+            qInfo().noquote() << "IStream::Read offset:" << readOffset
                               << "size:" << cb
                               << "result:" << Qt::hex << hr << Qt::dec;
             return hr;
         }
 
-        const qsizetype copySize = qMin(data.size(), static_cast<qsizetype>(cb));
-        memcpy(pv, data.constData(), static_cast<size_t>(copySize));
-        m_position += static_cast<quint64>(copySize);
+        const qsizetype copySize = qMin(data.size(), static_cast<qsizetype>(requestSize));
+        if (copySize > 0) {
+            memcpy(pv, data.constData(), static_cast<size_t>(copySize));
+            m_position += static_cast<quint64>(copySize);
+        }
         if (pcbRead) {
             *pcbRead = static_cast<ULONG>(copySize);
         }
 
-        const HRESULT result = copySize == static_cast<qsizetype>(cb) ? S_OK : S_FALSE;
-        qInfo().noquote() << "IStream::Read offset:" << (m_position - static_cast<quint64>(copySize))
-                          << "size:" << cb
-                          << "result:" << (result == S_OK ? "S_OK" : "S_FALSE");
-        return result;
+        // Match the existing clipboard stream behavior: a successful read returns
+        // S_OK even for the final short read. EOF is reported by S_OK with
+        // *pcbRead == 0 on the next call. This gives Explorer more predictable
+        // size/progress accounting.
+        qInfo().noquote() << "IStream::Read offset:" << readOffset
+                          << "request:" << cb
+                          << "actual:" << copySize
+                          << "position:" << m_position
+                          << "total:" << m_metadata.size
+                          << "result: S_OK";
+        return S_OK;
     }
 
     HRESULT STDMETHODCALLTYPE Write(const void *, ULONG, ULONG *) override
@@ -612,20 +622,53 @@ public:
         return STG_E_INVALIDFUNCTION;
     }
 
-    HRESULT STDMETHODCALLTYPE Stat(STATSTG *pstatstg, DWORD) override
+    HRESULT STDMETHODCALLTYPE Stat(STATSTG *pstatstg, DWORD grfStatFlag) override
     {
         if (!pstatstg) {
             return STG_E_INVALIDPOINTER;
         }
         memset(pstatstg, 0, sizeof(STATSTG));
+
+        if ((grfStatFlag & STATFLAG_NONAME) == 0) {
+            const std::wstring name = m_metadata.name.toStdWString();
+            const size_t bytes = (name.size() + 1) * sizeof(wchar_t);
+            auto *copy = static_cast<wchar_t *>(CoTaskMemAlloc(bytes));
+            if (!copy) {
+                return STG_E_INSUFFICIENTMEMORY;
+            }
+            wcscpy_s(copy, name.size() + 1, name.c_str());
+            pstatstg->pwcsName = copy;
+        }
+
+        const FILETIME fileTime = unixMsToFileTime(m_metadata.mtimeUnixMs);
         pstatstg->type = STGTY_STREAM;
         pstatstg->cbSize.QuadPart = m_metadata.size;
+        pstatstg->mtime = fileTime;
+        pstatstg->ctime = fileTime;
+        pstatstg->atime = fileTime;
+        pstatstg->grfMode = STGM_READ;
+        pstatstg->grfLocksSupported = 0;
+        pstatstg->clsid = CLSID_NULL;
+        pstatstg->grfStateBits = 0;
+        pstatstg->reserved = 0;
+
+        qInfo().noquote() << "IStream::Stat name:" << m_metadata.name
+                          << "size:" << m_metadata.size
+                          << "flags:" << grfStatFlag;
         return S_OK;
     }
 
-    HRESULT STDMETHODCALLTYPE Clone(IStream **) override
+    HRESULT STDMETHODCALLTYPE Clone(IStream **ppstm) override
     {
-        return E_NOTIMPL;
+        if (!ppstm) {
+            return STG_E_INVALIDPOINTER;
+        }
+        auto *clone = new RemoteFileStream(m_metadata, m_readBroker);
+        clone->m_position = m_position;
+        *ppstm = clone;
+        qInfo().noquote() << "IStream::Clone position:" << m_position
+                          << "size:" << m_metadata.size;
+        return S_OK;
     }
 
 private:
