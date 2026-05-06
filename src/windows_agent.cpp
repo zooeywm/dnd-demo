@@ -76,6 +76,34 @@ static void moveMouseToVirtualDesktop(int x, int y)
     }
 }
 
+static std::atomic_bool g_leftGuardArming {false};
+static std::atomic_bool g_hasPendingMove {false};
+static std::atomic_int g_pendingMoveX {0};
+static std::atomic_int g_pendingMoveY {0};
+
+static void guardedMoveMouseToVirtualDesktop(int x, int y)
+{
+    if (g_leftGuardArming.load(std::memory_order_acquire)) {
+        g_pendingMoveX.store(x, std::memory_order_release);
+        g_pendingMoveY.store(y, std::memory_order_release);
+        g_hasPendingMove.store(true, std::memory_order_release);
+        qInfo().noquote() << "MOVE deferred while left guard is arming x:" << x << "y:" << y;
+        return;
+    }
+    moveMouseToVirtualDesktop(x, y);
+}
+
+static void replayDeferredMoveIfAny()
+{
+    if (!g_hasPendingMove.exchange(false, std::memory_order_acq_rel)) {
+        return;
+    }
+    const int x = g_pendingMoveX.load(std::memory_order_acquire);
+    const int y = g_pendingMoveY.load(std::memory_order_acquire);
+    qInfo().noquote() << "replay deferred MOVE x:" << x << "y:" << y;
+    moveMouseToVirtualDesktop(x, y);
+}
+
 class DragState final {
 public:
     enum Value {
@@ -316,7 +344,7 @@ private:
     {
         Q_UNUSED(m_remoteWidth);
         Q_UNUSED(m_remoteHeight);
-        moveMouseToVirtualDesktop(x, y);
+        guardedMoveMouseToVirtualDesktop(x, y);
     }
 
     DragState *m_dragState = nullptr;
@@ -1159,7 +1187,7 @@ private:
 };
 
 constexpr UINT WM_APP_START_DRAG = WM_APP + 100;
-constexpr int kDragSourceWindowSize = 48;
+constexpr int kDragSourceWindowSize = 96;
 
 class OleDragController final : public QObject {
     Q_OBJECT
@@ -1200,6 +1228,11 @@ public slots:
                           << "initial x:" << initialPos.x()
                           << "y:" << initialPos.y();
 
+        // From this point until LEFTDOWN is safely consumed by our source HWND,
+        // network MOVE packets must not move the real cursor away. Otherwise the
+        // injected LEFTDOWN can land on Explorer/desktop and trigger selection/clicks.
+        g_leftGuardArming.store(true, std::memory_order_release);
+        g_hasPendingMove.store(false, std::memory_order_release);
         moveMouseToVirtualDesktop(initialPos.x(), initialPos.y());
 
         const int left = GetSystemMetrics(SM_XVIRTUALSCREEN);
@@ -1338,22 +1371,65 @@ private:
         SetFocus(m_hwnd);
         SetCapture(m_hwnd);
 
-        HWND hit = WindowFromPoint(cursor);
-        qInfo().noquote() << "before LEFTDOWN WindowFromPoint:" << reinterpret_cast<quintptr>(hit)
-                          << "source hwnd:" << reinterpret_cast<quintptr>(m_hwnd);
+        bool guarded = false;
+        for (int attempt = 0; attempt < 8; ++attempt) {
+            GetCursorPos(&cursor);
+            HWND hit = WindowFromPoint(cursor);
+            qInfo().noquote() << "before LEFTDOWN attempt:" << attempt
+                              << "WindowFromPoint:" << reinterpret_cast<quintptr>(hit)
+                              << "source hwnd:" << reinterpret_cast<quintptr>(m_hwnd)
+                              << "cursor x:" << cursor.x
+                              << "y:" << cursor.y;
+            if (hit == m_hwnd) {
+                guarded = true;
+                break;
+            }
+
+            // A high-frequency MOVE may have moved the cursor before WM_APP_START_DRAG
+            // runs, or a top-level window may have briefly covered the point. Put our
+            // topmost guard window under the current cursor again and retry. Do not click
+            // unless WindowFromPoint confirms that LEFTDOWN will be consumed by our HWND.
+            SetWindowPos(m_hwnd,
+                         HWND_TOPMOST,
+                         cursor.x - kDragSourceWindowSize / 2,
+                         cursor.y - kDragSourceWindowSize / 2,
+                         kDragSourceWindowSize,
+                         kDragSourceWindowSize,
+                         SWP_SHOWWINDOW);
+            ShowWindow(m_hwnd, SW_SHOWNORMAL);
+            BringWindowToTop(m_hwnd);
+            SetForegroundWindow(m_hwnd);
+            SetActiveWindow(m_hwnd);
+            SetFocus(m_hwnd);
+            Sleep(10);
+        }
+
+        if (!guarded) {
+            qWarning().noquote() << "LEFTDOWN guard failed; cancel drag to avoid clicking another window";
+            g_leftGuardArming.store(false, std::memory_order_release);
+            g_hasPendingMove.store(false, std::memory_order_release);
+            ReleaseCapture();
+            ShowWindow(m_hwnd, SW_HIDE);
+            dropSource->Release();
+            dataObject->Release();
+            m_dragInProgress = false;
+            return;
+        }
 
         // The physical button is still needed by DoDragDrop on this remote-controlled path,
-        // but the down event must not reach the desktop, otherwise empty desktop areas may
-        // start rubber-band selection.  Consume LEFTDOWN on the source HWND, then hide it
-        // before entering the OLE drag loop.
+        // but the down event must not reach the desktop/Explorer. It is sent only after
+        // WindowFromPoint proves our guard HWND is under the cursor.
         sendMouseButton(true);
         ShowWindow(m_hwnd, SW_HIDE);
+        g_leftGuardArming.store(false, std::memory_order_release);
+        replayDeferredMoveIfAny();
 
         DWORD effect = DROPEFFECT_NONE;
         const HRESULT hr = DoDragDrop(dataObject, dropSource, DROPEFFECT_COPY, &effect);
         qInfo().noquote() << "DoDragDrop returned hr:" << Qt::hex << hr << Qt::dec
                           << "effect:" << effect;
 
+        g_leftGuardArming.store(false, std::memory_order_release);
         sendMouseButton(false);
         ReleaseCapture();
         ShowWindow(m_hwnd, SW_HIDE);
