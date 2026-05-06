@@ -6,6 +6,7 @@
 #include <QMutex>
 #include <QMutexLocker>
 #include <QThread>
+#include <QPoint>
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QVector>
@@ -27,6 +28,45 @@ struct FileMetadata {
 };
 
 Q_DECLARE_METATYPE(FileMetadata)
+
+static void sendMouseButton(bool down)
+{
+    INPUT input {};
+    input.type = INPUT_MOUSE;
+    input.mi.dwFlags = down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
+    const UINT sent = SendInput(1, &input, sizeof(INPUT));
+    if (sent != 1) {
+        qWarning().noquote() << "SendInput" << (down ? "LEFTDOWN" : "LEFTUP") << "failed:" << GetLastError();
+    } else {
+        qInfo().noquote() << "SendInput" << (down ? "LEFTDOWN" : "LEFTUP");
+    }
+}
+
+static void moveMouseToVirtualDesktop(int x, int y)
+{
+    const int left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const int top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const int width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    const int height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    if (width <= 1 || height <= 1) {
+        return;
+    }
+
+    const int clampedX = qBound(left, left + x, left + width - 1);
+    const int clampedY = qBound(top, top + y, top + height - 1);
+
+    INPUT input {};
+    input.type = INPUT_MOUSE;
+    input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+    input.mi.dx = static_cast<LONG>((static_cast<qint64>(clampedX - left) * 65535) / (width - 1));
+    input.mi.dy = static_cast<LONG>((static_cast<qint64>(clampedY - top) * 65535) / (height - 1));
+    const UINT sent = SendInput(1, &input, sizeof(INPUT));
+    if (sent != 1) {
+        qWarning().noquote() << "SendInput MOVE failed:" << GetLastError();
+    } else {
+        qInfo().noquote() << "SendInput MOVE x:" << x << "y:" << y;
+    }
+}
 
 class DragState final {
 public:
@@ -105,7 +145,7 @@ public slots:
     }
 
 signals:
-    void fileDescriptorReceived(const FileMetadata &metadata);
+    void fileDescriptorReceived(const FileMetadata &metadata, const QPoint &initialPos);
     void readResponseReceived(quint32 seq, quint64 offset, const QByteArray &data);
     void readFailed(quint32 seq, const QString &message);
     void allReadsFailed(const QString &message);
@@ -184,7 +224,7 @@ private slots:
 private:
     void handleFileDescriptor(const QByteArray &payload)
     {
-        if (payload.size() < 20) {
+        if (payload.size() < 28) {
             qWarning().noquote() << "invalid FILE_DESCRIPTOR payload size:" << payload.size();
             return;
         }
@@ -193,17 +233,21 @@ private:
         FileMetadata metadata;
         metadata.size = vfd::readLe64(data);
         metadata.mtimeUnixMs = vfd::readLe64s(data + 8);
-        const quint32 nameLen = vfd::readLe32(data + 16);
-        if (payload.size() != 20 + static_cast<int>(nameLen)) {
+        const int remoteX = vfd::readLe32s(data + 16);
+        const int remoteY = vfd::readLe32s(data + 20);
+        const quint32 nameLen = vfd::readLe32(data + 24);
+        if (payload.size() != 28 + static_cast<int>(nameLen)) {
             qWarning().noquote() << "invalid FILE_DESCRIPTOR name length:" << nameLen;
             return;
         }
-        metadata.name = QString::fromUtf8(payload.constData() + 20, static_cast<int>(nameLen));
+        metadata.name = QString::fromUtf8(payload.constData() + 28, static_cast<int>(nameLen));
         qInfo().noquote() << "FILE_DESCRIPTOR name:" << metadata.name
                           << "size:" << metadata.size
-                          << "mtime_unix_ms:" << metadata.mtimeUnixMs;
+                          << "mtime_unix_ms:" << metadata.mtimeUnixMs
+                          << "initial x:" << remoteX
+                          << "y:" << remoteY;
         m_dragState->reset();
-        emit fileDescriptorReceived(metadata);
+        emit fileDescriptorReceived(metadata, QPoint(remoteX, remoteY));
     }
 
     void handleMove(const QByteArray &payload)
@@ -230,11 +274,13 @@ private:
             qWarning().noquote() << "invalid DROP payload size:" << payload.size();
         }
         m_dragState->setDrop();
+        sendMouseButton(false);
     }
 
     void handleCancel()
     {
         m_dragState->setCancel();
+        sendMouseButton(false);
     }
 
     void handleReadResponse(const QByteArray &payload)
@@ -260,19 +306,9 @@ private:
 
     void moveMouse(int x, int y) const
     {
-        if (m_remoteWidth <= 1 || m_remoteHeight <= 1) {
-            return;
-        }
-
-        INPUT input {};
-        input.type = INPUT_MOUSE;
-        input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
-        input.mi.dx = static_cast<LONG>((static_cast<qint64>(x) * 65535) / (m_remoteWidth - 1));
-        input.mi.dy = static_cast<LONG>((static_cast<qint64>(y) * 65535) / (m_remoteHeight - 1));
-        const UINT sent = SendInput(1, &input, sizeof(INPUT));
-        if (sent != 1) {
-            qWarning().noquote() << "SendInput MOVE failed:" << GetLastError();
-        }
+        Q_UNUSED(m_remoteWidth);
+        Q_UNUSED(m_remoteHeight);
+        moveMouseToVirtualDesktop(x, y);
     }
 
     DragState *m_dragState = nullptr;
@@ -679,6 +715,7 @@ public:
     {
         m_fileDescriptorFormat = static_cast<CLIPFORMAT>(RegisterClipboardFormatW(CFSTR_FILEDESCRIPTORW));
         m_fileContentsFormat = static_cast<CLIPFORMAT>(RegisterClipboardFormatW(CFSTR_FILECONTENTS));
+        m_preferredDropEffectFormat = static_cast<CLIPFORMAT>(RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT));
     }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **object) override
@@ -728,6 +765,10 @@ public:
             pmedium->pUnkForRelease = nullptr;
             return S_OK;
         }
+        if (isPreferredDropEffectRequest(*pformatetcIn)) {
+            qInfo().noquote() << "GetData request: PREFERREDDROPEFFECT";
+            return getDropEffect(pmedium, DROPEFFECT_COPY);
+        }
 
         return DV_E_FORMATETC;
     }
@@ -743,7 +784,9 @@ public:
             return E_POINTER;
         }
         logFormat(QStringLiteral("QueryGetData"), *pformatetc);
-        return isFileDescriptorRequest(*pformatetc) || isFileContentsRequest(*pformatetc)
+        return isFileDescriptorRequest(*pformatetc)
+                || isFileContentsRequest(*pformatetc)
+                || isPreferredDropEffectRequest(*pformatetc)
             ? S_OK
             : DV_E_FORMATETC;
     }
@@ -785,6 +828,13 @@ public:
         contents.tymed = TYMED_ISTREAM;
         formats.push_back(contents);
 
+        FORMATETC preferred {};
+        preferred.cfFormat = m_preferredDropEffectFormat;
+        preferred.dwAspect = DVASPECT_CONTENT;
+        preferred.lindex = -1;
+        preferred.tymed = TYMED_HGLOBAL;
+        formats.push_back(preferred);
+
         *ppenumFormatEtc = new FormatEtcEnumerator(formats);
         return S_OK;
     }
@@ -819,6 +869,32 @@ private:
             && (format.tymed & TYMED_ISTREAM)
             && format.dwAspect == DVASPECT_CONTENT
             && format.lindex == 0;
+    }
+
+    bool isPreferredDropEffectRequest(const FORMATETC &format) const
+    {
+        return format.cfFormat == m_preferredDropEffectFormat
+            && (format.tymed & TYMED_HGLOBAL)
+            && format.dwAspect == DVASPECT_CONTENT;
+    }
+
+    HRESULT getDropEffect(STGMEDIUM *medium, DWORD effect) const
+    {
+        HGLOBAL global = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, sizeof(DWORD));
+        if (!global) {
+            return STG_E_MEDIUMFULL;
+        }
+        auto *value = static_cast<DWORD *>(GlobalLock(global));
+        if (!value) {
+            GlobalFree(global);
+            return STG_E_MEDIUMFULL;
+        }
+        *value = effect;
+        GlobalUnlock(global);
+        medium->tymed = TYMED_HGLOBAL;
+        medium->hGlobal = global;
+        medium->pUnkForRelease = nullptr;
+        return S_OK;
     }
 
     HRESULT getFileDescriptor(STGMEDIUM *medium) const
@@ -856,9 +932,27 @@ private:
     void logFormat(const QString &prefix, const FORMATETC &format) const
     {
         qInfo().noquote() << prefix
+                          << "format:" << formatName(format.cfFormat)
                           << "cfFormat:" << format.cfFormat
                           << "tymed:" << format.tymed
                           << "lindex:" << format.lindex;
+    }
+
+    QString formatName(CLIPFORMAT cfFormat) const
+    {
+        if (cfFormat == m_fileDescriptorFormat) {
+            return QStringLiteral("CFSTR_FILEDESCRIPTORW");
+        }
+        if (cfFormat == m_fileContentsFormat) {
+            return QStringLiteral("CFSTR_FILECONTENTS");
+        }
+        if (cfFormat == m_preferredDropEffectFormat) {
+            return QStringLiteral("CFSTR_PREFERREDDROPEFFECT");
+        }
+        if (cfFormat == CF_HDROP) {
+            return QStringLiteral("CF_HDROP");
+        }
+        return QStringLiteral("unknown");
     }
 
     std::atomic<ULONG> m_refCount {1};
@@ -866,6 +960,7 @@ private:
     ReadBroker *m_readBroker = nullptr;
     CLIPFORMAT m_fileDescriptorFormat = 0;
     CLIPFORMAT m_fileContentsFormat = 0;
+    CLIPFORMAT m_preferredDropEffectFormat = 0;
 };
 
 class DropSource final : public IDropSource {
@@ -903,8 +998,16 @@ public:
         return ref;
     }
 
-    HRESULT STDMETHODCALLTYPE QueryContinueDrag(BOOL, DWORD) override
+    HRESULT STDMETHODCALLTYPE QueryContinueDrag(BOOL escapePressed, DWORD keyState) override
     {
+        if (escapePressed) {
+            qInfo().noquote() << "DropSource received ESC";
+            return DRAGDROP_S_CANCEL;
+        }
+        if (keyState != m_lastKeyState) {
+            qInfo().noquote() << "DropSource keyState:" << keyState;
+            m_lastKeyState = keyState;
+        }
         switch (m_state->value()) {
         case DragState::Cancel:
             qInfo().noquote() << "DropSource received CANCEL";
@@ -931,6 +1034,7 @@ private:
     std::atomic<ULONG> m_refCount {1};
     DragState *m_state = nullptr;
     bool m_loggedActive = false;
+    DWORD m_lastKeyState = 0xffffffff;
 };
 
 class OleDragController final : public QObject {
@@ -944,16 +1048,28 @@ public:
     }
 
 public slots:
-    void startDrag(const FileMetadata &metadata)
+    void startDrag(const FileMetadata &metadata, const QPoint &initialPos)
     {
         IDataObject *dataObject = new VirtualFileDataObject(metadata, m_readBroker);
         IDropSource *dropSource = new DropSource(m_dragState);
 
+        POINT cursor {};
+        GetCursorPos(&cursor);
+        qInfo().noquote() << "starting DoDragDrop for" << metadata.name
+                          << "initial x:" << initialPos.x()
+                          << "y:" << initialPos.y()
+                          << "current cursor x:" << cursor.x
+                          << "y:" << cursor.y;
+
+        moveMouseToVirtualDesktop(initialPos.x(), initialPos.y());
+        sendMouseButton(true);
+
         DWORD effect = DROPEFFECT_NONE;
-        qInfo().noquote() << "starting DoDragDrop for" << metadata.name;
         const HRESULT hr = DoDragDrop(dataObject, dropSource, DROPEFFECT_COPY, &effect);
         qInfo().noquote() << "DoDragDrop returned hr:" << Qt::hex << hr << Qt::dec
                           << "effect:" << effect;
+
+        sendMouseButton(false);
 
         dropSource->Release();
         dataObject->Release();

@@ -47,7 +47,7 @@ public:
         return {m_remoteWidth, m_remoteHeight};
     }
 
-    bool sendFileDescriptor(const QString &path)
+    bool sendFileDescriptor(const QString &path, const QPoint &remotePos)
     {
         const QFileInfo info(path);
         if (!info.exists() || !info.isFile()) {
@@ -59,6 +59,8 @@ public:
         QByteArray payload;
         vfd::appendLe64(payload, static_cast<quint64>(info.size()));
         vfd::appendLe64s(payload, info.lastModified().toMSecsSinceEpoch());
+        vfd::appendLe32s(payload, remotePos.x());
+        vfd::appendLe32s(payload, remotePos.y());
         vfd::appendLe32(payload, static_cast<quint32>(nameUtf8.size()));
         payload.append(nameUtf8);
 
@@ -66,7 +68,9 @@ public:
         m_fileSize = static_cast<quint64>(info.size());
 
         qInfo().noquote() << "dragEnter file:" << info.fileName()
-                          << "size:" << info.size();
+                          << "size:" << info.size()
+                          << "initial remote x:" << remotePos.x()
+                          << "y:" << remotePos.y();
         return send(vfd::MsgType::FileDescriptor, payload);
     }
 
@@ -241,11 +245,13 @@ protected:
             return;
         }
 
-        if (!m_client->sendFileDescriptor(path)) {
+        const QPoint remotePos = mapToRemote(event->position().toPoint());
+        if (!m_client->sendFileDescriptor(path, remotePos)) {
             event->ignore();
             return;
         }
 
+        m_client->sendMove(remotePos);
         event->acceptProposedAction();
     }
 
