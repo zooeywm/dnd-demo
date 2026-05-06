@@ -82,8 +82,8 @@ public slots:
             return;
         }
 
-        m_remoteWidth = GetSystemMetrics(SM_CXSCREEN);
-        m_remoteHeight = GetSystemMetrics(SM_CYSCREEN);
+        m_remoteWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        m_remoteHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
         qInfo().noquote() << "Windows agent listening on port" << port
                           << "desktop:" << m_remoteWidth << "x" << m_remoteHeight;
     }
@@ -202,6 +202,7 @@ private:
         qInfo().noquote() << "FILE_DESCRIPTOR name:" << metadata.name
                           << "size:" << metadata.size
                           << "mtime_unix_ms:" << metadata.mtimeUnixMs;
+        m_dragState->reset();
         emit fileDescriptorReceived(metadata);
     }
 
@@ -265,7 +266,7 @@ private:
 
         INPUT input {};
         input.type = INPUT_MOUSE;
-        input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
+        input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
         input.mi.dx = static_cast<LONG>((static_cast<qint64>(x) * 65535) / (m_remoteWidth - 1));
         input.mi.dy = static_cast<LONG>((static_cast<qint64>(y) * 65535) / (m_remoteHeight - 1));
         const UINT sent = SendInput(1, &input, sizeof(INPUT));
@@ -912,6 +913,10 @@ public:
             qInfo().noquote() << "DropSource received DROP";
             return DRAGDROP_S_DROP;
         case DragState::Active:
+            if (!m_loggedActive) {
+                qInfo().noquote() << "DropSource active";
+                m_loggedActive = true;
+            }
             return S_OK;
         }
         return S_OK;
@@ -925,6 +930,7 @@ public:
 private:
     std::atomic<ULONG> m_refCount {1};
     DragState *m_state = nullptr;
+    bool m_loggedActive = false;
 };
 
 class OleDragController final : public QObject {
@@ -940,8 +946,6 @@ public:
 public slots:
     void startDrag(const FileMetadata &metadata)
     {
-        m_dragState->reset();
-
         IDataObject *dataObject = new VirtualFileDataObject(metadata, m_readBroker);
         IDropSource *dropSource = new DropSource(m_dragState);
 
