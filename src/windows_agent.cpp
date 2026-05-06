@@ -22,6 +22,13 @@
 #include <shobjidl.h>
 #include <windows.h>
 
+#ifndef FD_PROGRESSUI
+#define FD_PROGRESSUI 0x00004000
+#endif
+#ifndef FD_UNICODE
+#define FD_UNICODE 0x80000000
+#endif
+
 struct FileMetadata {
     QString name;
     quint64 size = 0;
@@ -964,14 +971,32 @@ private:
 
         group->cItems = 1;
         FILEDESCRIPTORW &descriptor = group->fgd[0];
-        descriptor.dwFlags = FD_FILESIZE | FD_WRITESTIME | FD_ATTRIBUTES;
+
+        // Match the production clipboard virtual-file metadata more closely.
+        // FD_PROGRESSUI is the important Shell hint that allows Explorer to
+        // show its native copy progress UI for virtual file extraction.
+        descriptor.dwFlags = FD_UNICODE
+            | FD_ATTRIBUTES
+            | FD_PROGRESSUI
+            | FD_CREATETIME
+            | FD_ACCESSTIME
+            | FD_WRITESTIME
+            | FD_FILESIZE;
         descriptor.nFileSizeHigh = static_cast<DWORD>(m_metadata.size >> 32);
         descriptor.nFileSizeLow = static_cast<DWORD>(m_metadata.size & 0xffffffffULL);
-        descriptor.ftLastWriteTime = unixMsToFileTime(m_metadata.mtimeUnixMs);
+
+        const FILETIME writeTime = unixMsToFileTime(m_metadata.mtimeUnixMs);
+        descriptor.ftCreationTime = writeTime;
+        descriptor.ftLastAccessTime = writeTime;
+        descriptor.ftLastWriteTime = writeTime;
         descriptor.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
 
         const std::wstring fileName = m_metadata.name.toStdWString();
         wcsncpy_s(descriptor.cFileName, MAX_PATH, fileName.c_str(), _TRUNCATE);
+
+        qInfo().noquote() << "FILEDESCRIPTOR flags:" << Qt::hex << descriptor.dwFlags << Qt::dec
+                          << "size:" << m_metadata.size
+                          << "name:" << m_metadata.name;
 
         GlobalUnlock(global);
         medium->tymed = TYMED_HGLOBAL;
