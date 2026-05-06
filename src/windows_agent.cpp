@@ -5,8 +5,8 @@
 #include <QHash>
 #include <QMutex>
 #include <QMutexLocker>
-#include <QThread>
 #include <QPoint>
+#include <QThread>
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QVector>
@@ -1038,6 +1038,7 @@ private:
 };
 
 constexpr UINT WM_APP_START_DRAG = WM_APP + 100;
+constexpr int kDragSourceWindowSize = 48;
 
 class OleDragController final : public QObject {
     Q_OBJECT
@@ -1082,25 +1083,31 @@ public slots:
 
         const int left = GetSystemMetrics(SM_XVIRTUALSCREEN);
         const int top = GetSystemMetrics(SM_YVIRTUALSCREEN);
-        const int screenX = left + initialPos.x();
-        const int screenY = top + initialPos.y();
+        // Put a small real HWND *under the cursor* and make the injected LEFTDOWN
+        // land on this source window, not on the desktop/Explorer.  The window is
+        // hidden again before DoDragDrop enters the target area, so it only acts as
+        // a left-button guard and does not become the drop target.
+        const int screenX = left + initialPos.x() - kDragSourceWindowSize / 2;
+        const int screenY = top + initialPos.y() - kDragSourceWindowSize / 2;
 
         SetWindowPos(m_hwnd,
                      HWND_TOPMOST,
                      screenX,
                      screenY,
-                     8,
-                     8,
-                     SWP_SHOWWINDOW | SWP_NOACTIVATE);
-        ShowWindow(m_hwnd, SW_SHOWNOACTIVATE);
+                     kDragSourceWindowSize,
+                     kDragSourceWindowSize,
+                     SWP_SHOWWINDOW);
+        ShowWindow(m_hwnd, SW_SHOWNORMAL);
         UpdateWindow(m_hwnd);
+        BringWindowToTop(m_hwnd);
         SetForegroundWindow(m_hwnd);
+        SetActiveWindow(m_hwnd);
         SetFocus(m_hwnd);
 
         POINT cursor {};
         GetCursorPos(&cursor);
         qInfo().noquote() << "source window shown hwnd:" << reinterpret_cast<quintptr>(m_hwnd)
-                          << "screen x:" << screenX
+                          << "window x:" << screenX
                           << "y:" << screenY
                           << "cursor x:" << cursor.x
                           << "y:" << cursor.y;
@@ -1124,6 +1131,8 @@ private:
         }
 
         switch (message) {
+        case WM_NCHITTEST:
+            return HTCLIENT;
         case WM_APP_START_DRAG:
             self->performDoDragDrop();
             return 0;
@@ -1170,8 +1179,8 @@ private:
                                 WS_POPUP,
                                 0,
                                 0,
-                                8,
-                                8,
+                                kDragSourceWindowSize,
+                                kDragSourceWindowSize,
                                 nullptr,
                                 nullptr,
                                 instance,
@@ -1182,7 +1191,8 @@ private:
         }
 
         // Alpha must not be 0, otherwise the window can become completely non-interactive.
-        SetLayeredWindowAttributes(m_hwnd, 0, 1, LWA_ALPHA);
+        // Keep it almost invisible but hit-testable so LEFTDOWN is consumed by this HWND.
+        SetLayeredWindowAttributes(m_hwnd, 0, 8, LWA_ALPHA);
         ShowWindow(m_hwnd, SW_HIDE);
         qInfo().noquote() << "created Win32 drag source window hwnd:" << reinterpret_cast<quintptr>(m_hwnd);
         return true;
@@ -1203,9 +1213,20 @@ private:
                           << "y:" << cursor.y;
 
         SetForegroundWindow(m_hwnd);
+        SetActiveWindow(m_hwnd);
         SetFocus(m_hwnd);
         SetCapture(m_hwnd);
+
+        HWND hit = WindowFromPoint(cursor);
+        qInfo().noquote() << "before LEFTDOWN WindowFromPoint:" << reinterpret_cast<quintptr>(hit)
+                          << "source hwnd:" << reinterpret_cast<quintptr>(m_hwnd);
+
+        // The physical button is still needed by DoDragDrop on this remote-controlled path,
+        // but the down event must not reach the desktop, otherwise empty desktop areas may
+        // start rubber-band selection.  Consume LEFTDOWN on the source HWND, then hide it
+        // before entering the OLE drag loop.
         sendMouseButton(true);
+        ShowWindow(m_hwnd, SW_HIDE);
 
         DWORD effect = DROPEFFECT_NONE;
         const HRESULT hr = DoDragDrop(dataObject, dropSource, DROPEFFECT_COPY, &effect);
