@@ -1037,6 +1037,8 @@ private:
     DWORD m_lastKeyState = 0xffffffff;
 };
 
+constexpr UINT WM_APP_START_DRAG = WM_APP + 100;
+
 class OleDragController final : public QObject {
     Q_OBJECT
 
@@ -1045,23 +1047,164 @@ public:
         : m_dragState(dragState)
         , m_readBroker(readBroker)
     {
+        ensureSourceWindow();
+    }
+
+    ~OleDragController() override
+    {
+        if (m_hwnd) {
+            DestroyWindow(m_hwnd);
+            m_hwnd = nullptr;
+        }
     }
 
 public slots:
     void startDrag(const FileMetadata &metadata, const QPoint &initialPos)
     {
-        IDataObject *dataObject = new VirtualFileDataObject(metadata, m_readBroker);
+        if (m_dragInProgress) {
+            qWarning().noquote() << "drag already in progress; ignored new FILE_DESCRIPTOR";
+            return;
+        }
+        if (!ensureSourceWindow()) {
+            qWarning().noquote() << "failed to create Win32 drag source window";
+            return;
+        }
+
+        m_pendingMetadata = metadata;
+        m_pendingInitialPos = initialPos;
+        m_dragInProgress = true;
+
+        qInfo().noquote() << "preparing Win32 source window for" << metadata.name
+                          << "initial x:" << initialPos.x()
+                          << "y:" << initialPos.y();
+
+        moveMouseToVirtualDesktop(initialPos.x(), initialPos.y());
+
+        const int left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        const int top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        const int screenX = left + initialPos.x();
+        const int screenY = top + initialPos.y();
+
+        SetWindowPos(m_hwnd,
+                     HWND_TOPMOST,
+                     screenX,
+                     screenY,
+                     8,
+                     8,
+                     SWP_SHOWWINDOW | SWP_NOACTIVATE);
+        ShowWindow(m_hwnd, SW_SHOWNOACTIVATE);
+        UpdateWindow(m_hwnd);
+        SetForegroundWindow(m_hwnd);
+        SetFocus(m_hwnd);
+
+        POINT cursor {};
+        GetCursorPos(&cursor);
+        qInfo().noquote() << "source window shown hwnd:" << reinterpret_cast<quintptr>(m_hwnd)
+                          << "screen x:" << screenX
+                          << "y:" << screenY
+                          << "cursor x:" << cursor.x
+                          << "y:" << cursor.y;
+
+        PostMessageW(m_hwnd, WM_APP_START_DRAG, 0, 0);
+    }
+
+private:
+    static LRESULT CALLBACK wndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+    {
+        if (message == WM_NCCREATE) {
+            auto *create = reinterpret_cast<CREATESTRUCTW *>(lParam);
+            auto *self = static_cast<OleDragController *>(create->lpCreateParams);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+            return DefWindowProcW(hwnd, message, wParam, lParam);
+        }
+
+        auto *self = reinterpret_cast<OleDragController *>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (!self) {
+            return DefWindowProcW(hwnd, message, wParam, lParam);
+        }
+
+        switch (message) {
+        case WM_APP_START_DRAG:
+            self->performDoDragDrop();
+            return 0;
+        case WM_LBUTTONDOWN:
+            qInfo().noquote() << "source window WM_LBUTTONDOWN";
+            return 0;
+        case WM_MOUSEMOVE:
+            return 0;
+        case WM_LBUTTONUP:
+            qInfo().noquote() << "source window WM_LBUTTONUP";
+            return 0;
+        default:
+            return DefWindowProcW(hwnd, message, wParam, lParam);
+        }
+    }
+
+    bool ensureSourceWindow()
+    {
+        if (m_hwnd) {
+            return true;
+        }
+
+        const HINSTANCE instance = GetModuleHandleW(nullptr);
+        static const wchar_t className[] = L"LinuxDragBridgeSourceWindow";
+        static bool registered = false;
+        if (!registered) {
+            WNDCLASSEXW wc {};
+            wc.cbSize = sizeof(wc);
+            wc.lpfnWndProc = &OleDragController::wndProc;
+            wc.hInstance = instance;
+            wc.lpszClassName = className;
+            wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+            wc.hbrBackground = reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+            if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+                qWarning().noquote() << "RegisterClassExW failed:" << GetLastError();
+                return false;
+            }
+            registered = true;
+        }
+
+        m_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED,
+                                className,
+                                L"LinuxDragBridgeSourceWindow",
+                                WS_POPUP,
+                                0,
+                                0,
+                                8,
+                                8,
+                                nullptr,
+                                nullptr,
+                                instance,
+                                this);
+        if (!m_hwnd) {
+            qWarning().noquote() << "CreateWindowExW failed:" << GetLastError();
+            return false;
+        }
+
+        // Alpha must not be 0, otherwise the window can become completely non-interactive.
+        SetLayeredWindowAttributes(m_hwnd, 0, 1, LWA_ALPHA);
+        ShowWindow(m_hwnd, SW_HIDE);
+        qInfo().noquote() << "created Win32 drag source window hwnd:" << reinterpret_cast<quintptr>(m_hwnd);
+        return true;
+    }
+
+    void performDoDragDrop()
+    {
+        qInfo().noquote() << "WM_APP_START_DRAG: entering DoDragDrop";
+
+        IDataObject *dataObject = new VirtualFileDataObject(m_pendingMetadata, m_readBroker);
         IDropSource *dropSource = new DropSource(m_dragState);
 
         POINT cursor {};
         GetCursorPos(&cursor);
-        qInfo().noquote() << "starting DoDragDrop for" << metadata.name
-                          << "initial x:" << initialPos.x()
-                          << "y:" << initialPos.y()
-                          << "current cursor x:" << cursor.x
+        qInfo().noquote() << "DoDragDrop source hwnd:" << reinterpret_cast<quintptr>(m_hwnd)
+                          << "file:" << m_pendingMetadata.name
+                          << "cursor x:" << cursor.x
                           << "y:" << cursor.y;
 
-        moveMouseToVirtualDesktop(initialPos.x(), initialPos.y());
+        SetForegroundWindow(m_hwnd);
+        SetFocus(m_hwnd);
+        SetCapture(m_hwnd);
         sendMouseButton(true);
 
         DWORD effect = DROPEFFECT_NONE;
@@ -1070,14 +1213,20 @@ public slots:
                           << "effect:" << effect;
 
         sendMouseButton(false);
+        ReleaseCapture();
+        ShowWindow(m_hwnd, SW_HIDE);
 
         dropSource->Release();
         dataObject->Release();
+        m_dragInProgress = false;
     }
 
-private:
     DragState *m_dragState = nullptr;
     ReadBroker *m_readBroker = nullptr;
+    HWND m_hwnd = nullptr;
+    bool m_dragInProgress = false;
+    FileMetadata m_pendingMetadata;
+    QPoint m_pendingInitialPos;
 };
 
 int main(int argc, char *argv[])
