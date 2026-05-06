@@ -19,6 +19,7 @@
 #include <objidl.h>
 #include <ole2.h>
 #include <shlobj.h>
+#include <shobjidl.h>
 #include <windows.h>
 
 struct FileMetadata {
@@ -707,7 +708,7 @@ private:
     int m_index = 0;
 };
 
-class VirtualFileDataObject final : public IDataObject {
+class VirtualFileDataObject final : public IDataObject, public IDataObjectAsyncCapability {
 public:
     VirtualFileDataObject(FileMetadata metadata, ReadBroker *readBroker)
         : m_metadata(std::move(metadata))
@@ -725,6 +726,11 @@ public:
         }
         if (riid == IID_IUnknown || riid == IID_IDataObject) {
             *object = static_cast<IDataObject *>(this);
+            AddRef();
+            return S_OK;
+        }
+        if (riid == IID_IDataObjectAsyncCapability) {
+            *object = static_cast<IDataObjectAsyncCapability *>(this);
             AddRef();
             return S_OK;
         }
@@ -854,6 +860,51 @@ public:
         return OLE_E_ADVISENOTSUPPORTED;
     }
 
+
+    HRESULT STDMETHODCALLTYPE SetAsyncMode(BOOL fDoOpAsync) override
+    {
+        m_asyncMode = fDoOpAsync ? true : false;
+        qInfo().noquote() << "IDataObjectAsyncCapability::SetAsyncMode" << m_asyncMode.load();
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetAsyncMode(BOOL *pfIsOpAsync) override
+    {
+        if (!pfIsOpAsync) {
+            return E_POINTER;
+        }
+        *pfIsOpAsync = m_asyncMode.load() ? TRUE : FALSE;
+        qInfo().noquote() << "IDataObjectAsyncCapability::GetAsyncMode ->" << *pfIsOpAsync;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE StartOperation(IBindCtx *pbcReserved) override
+    {
+        Q_UNUSED(pbcReserved);
+        m_inOperation = true;
+        qInfo().noquote() << "IDataObjectAsyncCapability::StartOperation";
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE InOperation(BOOL *pfInAsyncOp) override
+    {
+        if (!pfInAsyncOp) {
+            return E_POINTER;
+        }
+        *pfInAsyncOp = m_inOperation.load() ? TRUE : FALSE;
+        qInfo().noquote() << "IDataObjectAsyncCapability::InOperation ->" << *pfInAsyncOp;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE EndOperation(HRESULT hResult, IBindCtx *pbcReserved, DWORD dwEffects) override
+    {
+        Q_UNUSED(pbcReserved);
+        m_inOperation = false;
+        qInfo().noquote() << "IDataObjectAsyncCapability::EndOperation result:" << Qt::hex << hResult << Qt::dec
+                          << "effects:" << dwEffects;
+        return S_OK;
+    }
+
 private:
     bool isFileDescriptorRequest(const FORMATETC &format) const
     {
@@ -961,6 +1012,8 @@ private:
     CLIPFORMAT m_fileDescriptorFormat = 0;
     CLIPFORMAT m_fileContentsFormat = 0;
     CLIPFORMAT m_preferredDropEffectFormat = 0;
+    std::atomic_bool m_asyncMode {true};
+    std::atomic_bool m_inOperation {false};
 };
 
 class DropSource final : public IDropSource {
